@@ -128,10 +128,23 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	// Two independent things are being decided here, and conflating them broke
+	// every non-TTY client:
+	//
+	//   status       101 when the client asked to upgrade, otherwise 200. Docker
+	//                does not vary this by TTY. A client that sent
+	//                "Upgrade: tcp" and receives 200 aborts with
+	//                "unable to upgrade to tcp, received 200".
+	//   content type raw for a TTY, multiplexed otherwise.
+	contentType := "application/vnd.docker.multiplexed-stream"
 	if instance.opts.Tty {
-		_, err = conn.Write([]byte("HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"))
+		contentType = "application/vnd.docker.raw-stream"
+	}
+
+	if strings.EqualFold(r.Header.Get("Upgrade"), "tcp") {
+		_, err = conn.Write([]byte("HTTP/1.1 101 UPGRADED\r\nContent-Type: " + contentType + "\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"))
 	} else {
-		_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.multiplexed-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"))
+		_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: " + contentType + "\r\n\r\n"))
 	}
 	if err != nil {
 		return
