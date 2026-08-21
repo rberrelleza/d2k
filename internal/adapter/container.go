@@ -151,9 +151,23 @@ func (a *KubernetesDockerAdapter) CreateContainer(ctx context.Context, opts RunO
 			return "", nil, fmt.Errorf("unable to build service: %w", svcErr)
 		}
 		if _, svcErr = a.client.CoreV1().Services(a.namespace).Create(ctx, svc, metav1.CreateOptions{}); svcErr != nil {
-			// Roll back the Deployment and ClusterIP service so we don't leave orphans.
+			// A Service of this name left over from an earlier failed create is
+			// d2k's own orphan, not something the caller can see or clean up.
+			// Adopt it, otherwise that container name is permanently unusable.
+			if errors.IsAlreadyExists(svcErr) {
+				if existing, getErr := a.client.CoreV1().Services(a.namespace).Get(ctx, svc.Name, metav1GetOptions()); getErr == nil {
+					svc.ResourceVersion = existing.ResourceVersion
+					// ClusterIP is immutable, so carry the assigned one over.
+					svc.Spec.ClusterIP = existing.Spec.ClusterIP
+					if _, updErr := a.client.CoreV1().Services(a.namespace).Update(ctx, svc, metav1.UpdateOptions{}); updErr == nil {
+						return string(created.UID), warnings, nil
+					}
+				}
+			}
+			// Roll back so we do not leave orphans. Delete the Service by the
+			// name actually used, which serviceName may have prefixed.
 			_ = a.client.AppsV1().Deployments(a.namespace).Delete(ctx, opts.Name, metav1.DeleteOptions{})
-			_ = a.client.CoreV1().Services(a.namespace).Delete(ctx, opts.Name, metav1.DeleteOptions{})
+			_ = a.client.CoreV1().Services(a.namespace).Delete(ctx, svc.Name, metav1.DeleteOptions{})
 			return "", nil, fmt.Errorf("unable to create service for %q: %w", opts.Name, svcErr)
 		}
 	}
@@ -212,7 +226,42 @@ func (a *KubernetesDockerAdapter) StopContainer(ctx context.Context, name string
 
 // StartContainer implements docker start: scales the Deployment back to 1 replica.
 func (a *KubernetesDockerAdapter) StartContainer(ctx context.Context, name string) error {
-	return a.scaleDeployment(ctx, name, 1)
+	if err := a.scaleDeployment(ctx, name, 1); err != nil {
+		return err
+	}
+	// Match Docker's contract: by the time start returns, inspect must be able
+	// to report an address. Best effort, so a slow image pull degrades to the
+	// previous behaviour rather than failing the call.
+	resolved, err := a.resolveDeploymentName(ctx, name)
+	if err != nil {
+		return nil
+	}
+	a.waitForPodIP(ctx, resolved, startTimeout)
+	return nil
+}
+
+// startTimeout bounds how long StartContainer waits for a pod address. Long
+// enough to cover an image pull on a cold node, short enough not to hang a
+// client indefinitely.
+const startTimeout = 90 * time.Second
+
+// waitForPodIP polls until a pod of the Deployment has an IP, or the timeout
+// expires. Returns the IP, or "" if none appeared in time.
+func (a *KubernetesDockerAdapter) waitForPodIP(ctx context.Context, deploymentName string, timeout time.Duration) string {
+	deadline := time.Now().Add(timeout)
+	for {
+		if ip := a.podIP(ctx, deploymentName); ip != "" {
+			return ip
+		}
+		if time.Now().After(deadline) {
+			return ""
+		}
+		select {
+		case <-ctx.Done():
+			return ""
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 // RemoveContainer implements docker rm: deletes the Deployment and its associated Service (if any).
