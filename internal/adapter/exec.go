@@ -56,8 +56,20 @@ func (a *KubernetesDockerAdapter) ExecContainer(ctx context.Context, opts ExecOp
 		return fmt.Errorf("unable to create SPDY executor: %w", err)
 	}
 
+	// Only wire stdin when the exec actually asked for it. PodExecOptions above
+	// already honours AttachStdin, but StreamOptions is what makes client-go
+	// open a stdin stream and copy from the reader until EOF. The reader here is
+	// the hijacked connection, which never reaches EOF because the client is
+	// waiting for output, so passing it unconditionally makes every exec without
+	// stdin block until a timeout. A client with a shorter deadline sees its
+	// socket close with no explanation.
+	var in io.Reader
+	if opts.AttachStdin {
+		in = stdin
+	}
+
 	return executor.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdin:  stdin,
+		Stdin:  in,
 		Stdout: stdout,
 		Stderr: stderr,
 		Tty:    opts.Tty,
