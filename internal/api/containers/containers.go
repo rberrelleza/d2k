@@ -15,6 +15,7 @@ package containers
 
 import (
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -249,7 +250,7 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 	name := containerName(r.URL.Path, "/start")
 	if err := h.adapter.StartContainer(r.Context(), name); err != nil {
 		h.logger.Errorw("StartContainer failed", "name", name, "error", err)
-		httputils.WriteError(w, http.StatusInternalServerError, err.Error())
+		writeContainerError(w, name, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -260,7 +261,7 @@ func (h *Handler) Stop(w http.ResponseWriter, r *http.Request) {
 	name := containerName(r.URL.Path, "/stop")
 	if err := h.adapter.StopContainer(r.Context(), name); err != nil {
 		h.logger.Errorw("StopContainer failed", "name", name, "error", err)
-		httputils.WriteError(w, http.StatusInternalServerError, err.Error())
+		writeContainerError(w, name, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -271,12 +272,12 @@ func (h *Handler) Restart(w http.ResponseWriter, r *http.Request) {
 	name := containerName(r.URL.Path, "/restart")
 	if err := h.adapter.StopContainer(r.Context(), name); err != nil {
 		h.logger.Errorw("Restart/stop failed", "name", name, "error", err)
-		httputils.WriteError(w, http.StatusInternalServerError, err.Error())
+		writeContainerError(w, name, err)
 		return
 	}
 	if err := h.adapter.StartContainer(r.Context(), name); err != nil {
 		h.logger.Errorw("Restart/start failed", "name", name, "error", err)
-		httputils.WriteError(w, http.StatusInternalServerError, err.Error())
+		writeContainerError(w, name, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -287,7 +288,7 @@ func (h *Handler) Remove(w http.ResponseWriter, r *http.Request) {
 	name := containerName(r.URL.Path, "")
 	if err := h.adapter.RemoveContainer(r.Context(), name); err != nil {
 		h.logger.Errorw("RemoveContainer failed", "name", name, "error", err)
-		httputils.WriteError(w, http.StatusInternalServerError, err.Error())
+		writeContainerError(w, name, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -298,6 +299,10 @@ func (h *Handler) Inspect(w http.ResponseWriter, r *http.Request) {
 	name := containerName(r.URL.Path, "/json")
 	result, err := h.adapter.InspectContainer(r.Context(), name)
 	if err != nil {
+		if goerrors.Is(err, adapter.ErrContainerNotFound) {
+			httputils.WriteError(w, http.StatusNotFound, "No such container: "+name)
+			return
+		}
 		h.logger.Errorw("InspectContainer failed", "name", name, "error", err)
 		httputils.WriteError(w, http.StatusNotFound, err.Error())
 		return
@@ -454,4 +459,18 @@ func (h *Handler) Attach(w http.ResponseWriter, r *http.Request) {
 func mustJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// writeContainerError maps adapter errors onto Docker Engine API status codes.
+//
+// A missing container must be 404, not 500. Clients distinguish the two: tooling
+// that stops/removes a name before reusing it treats 404 as "nothing to do" and
+// 500 as a hard failure, so returning 500 here makes such clients give up and,
+// worse, leave their own state half-built.
+func writeContainerError(w http.ResponseWriter, name string, err error) {
+	if goerrors.Is(err, adapter.ErrContainerNotFound) {
+		httputils.WriteError(w, http.StatusNotFound, "No such container: "+name)
+		return
+	}
+	httputils.WriteError(w, http.StatusInternalServerError, err.Error())
 }

@@ -3,7 +3,9 @@ package adapter
 import (
 	"context"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
+	"os"
 	"strings"
 	"strconv"
 	"time"
@@ -22,6 +24,12 @@ import (
 	"github.com/portainer/d2k/internal/types"
 	"github.com/portainer/d2k/pkg/portmapper"
 )
+
+// ErrContainerNotFound reports that no workload matches the requested container
+// name or id. Callers use errors.Is to map it to the Docker Engine API's 404,
+// which clients rely on to tell "gone" apart from "broken": tooling that cleans
+// up before creating treats a 500 as fatal and gives up.
+var ErrContainerNotFound = goerrors.New("container not found")
 
 // RunOptions mirrors the subset of docker run flags that d2k supports.
 type RunOptions struct {
@@ -178,6 +186,9 @@ func (a *KubernetesDockerAdapter) ListContainers(ctx context.Context, all bool) 
 				summary.IPAddress = svc.Status.LoadBalancer.Ingress[0].Hostname
 			}
 		}
+		if summary.IPAddress == "" {
+			summary.IPAddress = a.podIP(ctx, d.Name)
+		}
 
 		summaries = append(summaries, summary)
 	}
@@ -287,7 +298,15 @@ func (a *KubernetesDockerAdapter) InspectContainer(ctx context.Context, name str
 		}
 	}
 
-	result := deploymentToContainerJSON(*d, lbIP)
+	// A pod IP is reachable in-namespace whether or not ports were published, so
+	// it is the better answer. Keep the LoadBalancer address as a fallback for
+	// clients that specifically want the external address.
+	ip := a.podIP(ctx, resolved)
+	if ip == "" {
+		ip = lbIP
+	}
+
+	result := deploymentToContainerJSON(*d, ip)
 	return &result, nil
 }
 
@@ -392,11 +411,27 @@ func (a *KubernetesDockerAdapter) buildDeployment(ctx context.Context, opts RunO
 	}, nil
 }
 
+// publishedServiceType returns the Service type to use for published ports.
+//
+// D2K_PUBLISHED_SERVICE_TYPE=ClusterIP is worth setting when the clients live in
+// the cluster: on a cloud provider every LoadBalancer Service provisions a real
+// load balancer, which is minutes of latency and real money per container.
+func publishedServiceType() corev1.ServiceType {
+	switch strings.ToLower(os.Getenv("D2K_PUBLISHED_SERVICE_TYPE")) {
+	case "clusterip":
+		return corev1.ServiceTypeClusterIP
+	case "nodeport":
+		return corev1.ServiceTypeNodePort
+	default:
+		return corev1.ServiceTypeLoadBalancer
+	}
+}
+
 func (a *KubernetesDockerAdapter) buildService(name string, kind portmapper.MappingKind, mappings []portmapper.PortMapping) (*corev1.Service, error) {
 	var svcType corev1.ServiceType
 	switch kind {
 	case portmapper.LoadBalancerService:
-		svcType = corev1.ServiceTypeLoadBalancer
+		svcType = publishedServiceType()
 	case portmapper.NodePortService:
 		svcType = corev1.ServiceTypeNodePort
 	default:
@@ -404,6 +439,7 @@ func (a *KubernetesDockerAdapter) buildService(name string, kind portmapper.Mapp
 	}
 
 	var ports []corev1.ServicePort
+	seen := map[int32]bool{}
 	for i, m := range mappings {
 		sp := corev1.ServicePort{
 			Name:       fmt.Sprintf("port-%d", i),
@@ -414,7 +450,23 @@ func (a *KubernetesDockerAdapter) buildService(name string, kind portmapper.Mapp
 		if m.HostPort == 0 {
 			sp.Port = int32(m.ContainerPort)
 		}
-		ports = append(ports, sp)
+		if !seen[sp.Port] {
+			seen[sp.Port] = true
+			ports = append(ports, sp)
+		}
+		// Expose the container port too. On a Docker network peers dial
+		// <container-name>:<container-port>, so a Service carrying only the
+		// published host port leaves that address unreachable.
+		cp := int32(m.ContainerPort)
+		if !seen[cp] {
+			seen[cp] = true
+			ports = append(ports, corev1.ServicePort{
+				Name:       fmt.Sprintf("cport-%d", i),
+				Port:       cp,
+				TargetPort: intstr.FromInt(m.ContainerPort),
+				Protocol:   corev1.Protocol(m.Protocol),
+			})
+		}
 	}
 
 	svcName := serviceName(name)
@@ -478,7 +530,36 @@ func (a *KubernetesDockerAdapter) resolveDeploymentName(ctx context.Context, nam
 			return d.Name, nil
 		}
 	}
-	return "", fmt.Errorf("container %q not found", nameOrID)
+	return "", fmt.Errorf("container %q: %w", nameOrID, ErrContainerNotFound)
+}
+
+// podIP returns the IP of a pod belonging to the named Deployment.
+//
+// This is the honest analogue of a Docker container IP: it is routable from
+// anywhere in the namespace. Reporting only a LoadBalancer ingress address means
+// a container with no published ports appears to have no address at all, which
+// breaks any client that connects to containers by IP.
+func (a *KubernetesDockerAdapter) podIP(ctx context.Context, deploymentName string) string {
+	pods, err := a.client.CoreV1().Pods(a.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=" + deploymentName,
+	})
+	if err != nil {
+		return ""
+	}
+	// Prefer a running pod; fall back to any pod that has an IP assigned.
+	fallback := ""
+	for _, pod := range pods.Items {
+		if pod.Status.PodIP == "" {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodRunning {
+			return pod.Status.PodIP
+		}
+		if fallback == "" {
+			fallback = pod.Status.PodIP
+		}
+	}
+	return fallback
 }
 
 // --- scale helper ---
