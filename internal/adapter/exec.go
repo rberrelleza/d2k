@@ -57,9 +57,25 @@ func (a *KubernetesDockerAdapter) ExecContainer(ctx context.Context, opts ExecOp
 	}
 
 	return executor.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdin:  stdin,
+		Stdin:  execStdin(opts, stdin),
 		Stdout: stdout,
 		Stderr: stderr,
 		Tty:    opts.Tty,
 	})
+}
+
+// execStdin returns the reader to attach, or nil when the exec did not ask for
+// stdin.
+//
+// PodExecOptions already honours AttachStdin, but StreamOptions is what makes
+// client-go open a stdin stream and copy from the reader until EOF. The reader
+// is the hijacked connection, which never reaches EOF because the client is
+// waiting for output, so passing it unconditionally makes every exec without
+// stdin block until a timeout. A client with a shorter deadline sees its socket
+// close with no explanation.
+func execStdin(opts ExecOptions, stdin io.Reader) io.Reader {
+	if !opts.AttachStdin {
+		return nil
+	}
+	return stdin
 }
