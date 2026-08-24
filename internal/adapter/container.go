@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"strings"
 	"strconv"
@@ -22,6 +23,11 @@ import (
 	"github.com/portainer/d2k/internal/types"
 	"github.com/portainer/d2k/pkg/portmapper"
 )
+
+// ErrContainerNotFound reports that no workload matches the requested container
+// name or id. Callers use errors.Is to map it to the Docker Engine API's 404,
+// which clients rely on to tell "gone" apart from "broken".
+var ErrContainerNotFound = goerrors.New("container not found")
 
 // RunOptions mirrors the subset of docker run flags that d2k supports.
 type RunOptions struct {
@@ -478,7 +484,7 @@ func (a *KubernetesDockerAdapter) resolveDeploymentName(ctx context.Context, nam
 			return d.Name, nil
 		}
 	}
-	return "", fmt.Errorf("container %q not found", nameOrID)
+	return "", fmt.Errorf("container %q: %w", nameOrID, ErrContainerNotFound)
 }
 
 // --- scale helper ---
