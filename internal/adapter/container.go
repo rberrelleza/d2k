@@ -143,9 +143,23 @@ func (a *KubernetesDockerAdapter) CreateContainer(ctx context.Context, opts RunO
 			return "", nil, fmt.Errorf("unable to build service: %w", svcErr)
 		}
 		if _, svcErr = a.client.CoreV1().Services(a.namespace).Create(ctx, svc, metav1.CreateOptions{}); svcErr != nil {
-			// Roll back the Deployment and ClusterIP service so we don't leave orphans.
+			// A Service of this name left over from an earlier failed create is
+			// d2k's own orphan, not something the caller can see or clean up.
+			// Adopt it, otherwise that container name is permanently unusable.
+			if errors.IsAlreadyExists(svcErr) {
+				if existing, getErr := a.client.CoreV1().Services(a.namespace).Get(ctx, svc.Name, metav1GetOptions()); getErr == nil {
+					svc.ResourceVersion = existing.ResourceVersion
+					// ClusterIP is immutable, so carry the assigned one over.
+					svc.Spec.ClusterIP = existing.Spec.ClusterIP
+					if _, updErr := a.client.CoreV1().Services(a.namespace).Update(ctx, svc, metav1.UpdateOptions{}); updErr == nil {
+						return string(created.UID), warnings, nil
+					}
+				}
+			}
+			// Roll back so we do not leave orphans. Delete the Service by the
+			// name actually used, which serviceName may have prefixed.
 			_ = a.client.AppsV1().Deployments(a.namespace).Delete(ctx, opts.Name, metav1.DeleteOptions{})
-			_ = a.client.CoreV1().Services(a.namespace).Delete(ctx, opts.Name, metav1.DeleteOptions{})
+			_ = a.client.CoreV1().Services(a.namespace).Delete(ctx, svc.Name, metav1.DeleteOptions{})
 			return "", nil, fmt.Errorf("unable to create service for %q: %w", opts.Name, svcErr)
 		}
 	}
