@@ -178,6 +178,9 @@ func (a *KubernetesDockerAdapter) ListContainers(ctx context.Context, all bool) 
 				summary.IPAddress = svc.Status.LoadBalancer.Ingress[0].Hostname
 			}
 		}
+		if summary.IPAddress == "" {
+			summary.IPAddress = a.podIP(ctx, d.Name)
+		}
 
 		summaries = append(summaries, summary)
 	}
@@ -287,7 +290,15 @@ func (a *KubernetesDockerAdapter) InspectContainer(ctx context.Context, name str
 		}
 	}
 
-	result := deploymentToContainerJSON(*d, lbIP)
+	// A pod IP is reachable in-namespace whether or not ports were published, so
+	// it is the better answer. Keep the LoadBalancer address as a fallback for
+	// clients that specifically want the external address.
+	ip := a.podIP(ctx, resolved)
+	if ip == "" {
+		ip = lbIP
+	}
+
+	result := deploymentToContainerJSON(*d, ip)
 	return &result, nil
 }
 
@@ -479,6 +490,36 @@ func (a *KubernetesDockerAdapter) resolveDeploymentName(ctx context.Context, nam
 		}
 	}
 	return "", fmt.Errorf("container %q not found", nameOrID)
+}
+
+// podIP returns the IP of a pod belonging to the named Deployment.
+//
+// This is the honest analogue of a Docker container IP: it is routable from
+// anywhere in the namespace. Deriving the address only from a Service's
+// LoadBalancer ingress means a container with no published ports appears to have
+// no address at all, and any client that connects to containers by IP cannot
+// reach it.
+func (a *KubernetesDockerAdapter) podIP(ctx context.Context, deploymentName string) string {
+	pods, err := a.client.CoreV1().Pods(a.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=" + deploymentName,
+	})
+	if err != nil {
+		return ""
+	}
+	// Prefer a running pod; fall back to any pod that has an IP assigned.
+	fallback := ""
+	for _, pod := range pods.Items {
+		if pod.Status.PodIP == "" {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodRunning {
+			return pod.Status.PodIP
+		}
+		if fallback == "" {
+			fallback = pod.Status.PodIP
+		}
+	}
+	return fallback
 }
 
 // --- scale helper ---
