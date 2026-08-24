@@ -119,11 +119,16 @@ func New(a *adapter.KubernetesDockerAdapter, namespace string, swarmMode bool, l
 	})
 
 	// Versioned path prefix stripping - Docker CLI sends /v1.41/containers/json etc.
+	//
+	// Only strip a first segment that really is an API version. Testing for a
+	// "/v" prefix alone also matches genuine endpoints, most importantly
+	// /volumes/..., which was rewritten to /create or /{name} and could never
+	// match its registered route.
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v") {
 			// Find the end of the version segment, e.g. /v1.41/...
 			rest := r.URL.Path[1:] // strip leading /
-			if idx := strings.Index(rest, "/"); idx != -1 {
+			if idx := strings.Index(rest, "/"); idx != -1 && isAPIVersion(rest[:idx]) {
 				r2 := r.Clone(r.Context())
 				// Clone the URL to avoid mutating the original request's URL,
 				// which would corrupt logging and any subsequent middleware reads.
@@ -138,4 +143,19 @@ func New(a *adapter.KubernetesDockerAdapter, namespace string, swarmMode bool, l
 	})
 
 	return middleware.Logging(logger)(middleware.RequestID(handler))
+}
+
+// isAPIVersion reports whether a leading path segment is a Docker Engine API
+// version such as "v1.41" or "v1", as opposed to a resource collection whose
+// name merely starts with v, such as "volumes".
+func isAPIVersion(segment string) bool {
+	if len(segment) < 2 || segment[0] != 'v' {
+		return false
+	}
+	for _, r := range segment[1:] {
+		if (r < '0' || r > '9') && r != '.' {
+			return false
+		}
+	}
+	return true
 }
