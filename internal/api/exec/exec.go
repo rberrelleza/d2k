@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/portainer/d2k/internal/adapter"
+	"github.com/portainer/d2k/pkg/dockerstream"
 	"github.com/portainer/d2k/pkg/httputils"
 	"github.com/gorilla/websocket"
 )
@@ -137,8 +138,25 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 	}
 
 	opts := instance.opts
-	if err := h.adapter.ExecContainer(r.Context(), opts, brw, brw, brw); err != nil {
+
+	// The response above advertised the stream format, so honour it. Without a
+	// TTY Docker frames every payload with an 8-byte header, and clients parse
+	// those strictly: raw bytes on a connection announced as multiplexed make
+	// them misread the length prefix and drop the stream, which the caller sees
+	// as a closed socket rather than an error it can act on.
+	stdout, stderr := io.Writer(brw), io.Writer(brw)
+	if !opts.Tty {
+		mux := dockerstream.NewMuxer(brw)
+		stdout, stderr = mux.Stdout(), mux.Stderr()
+	}
+
+	if err := h.adapter.ExecContainer(r.Context(), opts, brw, stdout, stderr); err != nil {
 		h.logger.Warnw("exec stream ended", "id", id, "error", err)
+	}
+	// A hijacked connection hands back a buffered writer, so anything still
+	// buffered has to be pushed before the deferred Close.
+	if err := brw.Flush(); err != nil {
+		h.logger.Debugw("exec flush failed", "id", id, "error", err)
 	}
 }
 
