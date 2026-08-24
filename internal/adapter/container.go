@@ -201,7 +201,18 @@ func (a *KubernetesDockerAdapter) StopContainer(ctx context.Context, name string
 
 // StartContainer implements docker start: scales the Deployment back to 1 replica.
 func (a *KubernetesDockerAdapter) StartContainer(ctx context.Context, name string) error {
-	return a.scaleDeployment(ctx, name, 1)
+	if err := a.scaleDeployment(ctx, name, 1); err != nil {
+		return err
+	}
+	// Match Docker's contract: by the time start returns, inspect must be able
+	// to report an address. Best effort, so a slow image pull degrades to the
+	// previous behaviour rather than failing the call.
+	resolved, err := a.resolveDeploymentName(ctx, name)
+	if err != nil {
+		return nil
+	}
+	a.waitForPodIP(ctx, resolved, startTimeout)
+	return nil
 }
 
 // RemoveContainer implements docker rm: deletes the Deployment and its associated Service (if any).
@@ -479,6 +490,58 @@ func (a *KubernetesDockerAdapter) resolveDeploymentName(ctx context.Context, nam
 		}
 	}
 	return "", fmt.Errorf("container %q not found", nameOrID)
+}
+
+// podIP returns the IP of a pod belonging to the named Deployment.
+func (a *KubernetesDockerAdapter) podIP(ctx context.Context, deploymentName string) string {
+	pods, err := a.client.CoreV1().Pods(a.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=" + deploymentName,
+	})
+	if err != nil {
+		return ""
+	}
+	fallback := ""
+	for _, pod := range pods.Items {
+		if pod.Status.PodIP == "" {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodRunning {
+			return pod.Status.PodIP
+		}
+		if fallback == "" {
+			fallback = pod.Status.PodIP
+		}
+	}
+	return fallback
+}
+
+// startTimeout bounds how long StartContainer waits for a pod address. Long
+// enough to cover an image pull on a cold node, short enough not to hang a
+// client indefinitely.
+const startTimeout = 90 * time.Second
+
+// waitForPodIP polls until a pod of the Deployment has an IP, or the timeout
+// expires. Returns the IP, or "" if none appeared in time.
+//
+// Docker's contract is that once start returns, the container is running and
+// inspect reports its address. Scaling a Deployment to 1 only means the object
+// was accepted, so without this a client that starts a container and immediately
+// connects gets nothing.
+func (a *KubernetesDockerAdapter) waitForPodIP(ctx context.Context, deploymentName string, timeout time.Duration) string {
+	deadline := time.Now().Add(timeout)
+	for {
+		if ip := a.podIP(ctx, deploymentName); ip != "" {
+			return ip
+		}
+		if time.Now().After(deadline) {
+			return ""
+		}
+		select {
+		case <-ctx.Done():
+			return ""
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 // --- scale helper ---
